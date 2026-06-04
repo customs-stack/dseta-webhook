@@ -1,5 +1,5 @@
 """
-DSETA Customs Clearance Webhook — Fixed
+DSETA Customs Clearance Webhook v3
 """
 
 import os
@@ -28,7 +28,7 @@ def extract_job_data(from_email, subject, body):
         "content-type": "application/json"
     }
     payload = {
-        "model": "claude-sonnet-4-20250514",
+        "model": "claude-opus-4-5",
         "max_tokens": 1000,
         "messages": [{
             "role": "user",
@@ -39,40 +39,42 @@ From: {from_email}
 Subject: {subject}
 Body: {body}
 
-Extract the following and return as JSON only, no other text, no markdown:
+Return ONLY a JSON object, no markdown, no explanation:
 {{
-  "services": "list services mentioned e.g. CDS, ENS, ELO or Unknown if not stated",
-  "exporter": "exporter name and country if mentioned, else Unknown",
-  "importer": "importer name if mentioned, else Unknown",
-  "goods": "goods description if mentioned, else Unknown",
-  "route": "route if mentioned e.g. Calais to Dover, else Unknown",
-  "input_sheet": "a clean formatted text block with all above info ready to input into Descartes customs software"
+  "services": "CDS, ENS, ELO or Unknown",
+  "exporter": "exporter name and country or Unknown",
+  "importer": "importer name or Unknown",
+  "goods": "goods description or Unknown",
+  "route": "route e.g. Calais to Dover or Unknown"
 }}"""
         }]
     }
-    
-    with httpx.Client() as client:
-        response = client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=payload,
-            timeout=30.0
-        )
-    
-    result = response.json()
-    text = result["content"][0]["text"]
-    
+
     try:
-        return json.loads(text)
-    except:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload
+            )
+        result = response.json()
+        # Handle response properly
+        if "content" in result and len(result["content"]) > 0:
+            text = result["content"][0].get("text", "{}")
+            # Clean any markdown
+            text = text.strip().replace("```json", "").replace("```", "").strip()
+            return json.loads(text)
+        else:
+            raise Exception(f"API error: {result}")
+    except Exception as e:
         return {
-            "services": "Unknown",
+            "services": "To be confirmed",
             "exporter": "Unknown",
             "importer": "Unknown",
             "goods": "Unknown",
-            "route": "Unknown",
-            "input_sheet": text
+            "route": "Unknown"
         }
+
 
 @app.route("/new-email", methods=["POST"])
 def new_email():
@@ -102,8 +104,6 @@ Importer:   {job_data.get('importer', 'Unknown')}
 Goods:      {job_data.get('goods', 'Unknown')}
 Route:      {job_data.get('route', 'Unknown')}
 {'='*50}
-{job_data.get('input_sheet', '')}
-{'='*50}
 Generated: {datetime.datetime.now().strftime("%d/%m/%Y %H:%M")}
 """
 
@@ -117,7 +117,7 @@ Please quote this reference in any future correspondence.
 
 Services noted: {job_data.get('services', 'To be confirmed')}
 
-We will begin processing your declaration and will update you once complete.
+We will begin processing your declaration shortly and will update you once complete.
 
 Kind regards,
 DSETA Consulting Ltd
@@ -140,8 +140,8 @@ customs@dseta.co.uk"""
 
 @app.route("/job-completed", methods=["POST"])
 def job_completed():
-    data      = request.json or {}
-    reference = data.get("reference", "")
+    data       = request.json or {}
+    reference  = data.get("reference", "")
     from_email = data.get("from_email", "")
 
     completion_email = f"""Dear Customer,
@@ -168,7 +168,7 @@ customs@dseta.co.uk"""
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "DSETA webhook running", "version": "3.0"}), 200
+    return jsonify({"status": "DSETA webhook running", "version": "3.1"}), 200
 
 
 if __name__ == "__main__":

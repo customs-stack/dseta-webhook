@@ -1,33 +1,23 @@
 """
-DSETA Customs Clearance Webhook v4
+DSETA Customs Clearance Webhook v5
 ===================================
-Fixes:
-- Loop prevention (ignore dseta.co.uk emails)
-- Proper email body extraction
-- Attachment handling instructions
-- Clean auto-reply from name
-- Sheet spam prevention
+Full extraction from email body + attachments
 """
 
 import os
 import json
 import datetime
+import base64
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-# ── Domains to ignore (prevents loop) ─────────────────────────────────────────
 IGNORED_DOMAINS = [
-    "dseta.co.uk",
-    "noreply",
-    "no-reply",
-    "mailer-daemon",
-    "postmaster",
-    "descartes",
-    "cnsonline",
-    "douane.gouv.fr"
+    "dseta.co.uk", "noreply", "no-reply",
+    "mailer-daemon", "postmaster", "descartes",
+    "cnsonline", "douane.gouv.fr"
 ]
 
 def should_ignore_email(from_email):
@@ -47,42 +37,109 @@ def get_next_reference(last_ref):
     except:
         return "DSETA/006"
 
-def extract_job_data(from_email, subject, body):
+def download_attachment(url):
+    """Download attachment from URL and return base64 encoded content"""
     import httpx
+    try:
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            response = client.get(url)
+            if response.status_code == 200:
+                return base64.standard_b64encode(response.content).decode("utf-8")
+    except:
+        pass
+    return None
+
+def extract_all_data(from_email, subject, body, attachment_urls=None):
+    """Extract data from email body + attachments using Claude"""
+    import httpx
+
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json"
     }
+
+    # Build message content — start with email text
+    content = []
+
+    # Add attachment PDFs if available
+    if attachment_urls:
+        for url_info in attachment_urls:
+            url = url_info.get("url", "") if isinstance(url_info, dict) else str(url_info)
+            filename = url_info.get("filename", "attachment") if isinstance(url_info, dict) else "attachment"
+            if url:
+                file_data = download_attachment(url)
+                if file_data:
+                    # Determine media type
+                    if filename.lower().endswith(".pdf"):
+                        content.append({
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": file_data
+                            }
+                        })
+                    else:
+                        # For images
+                        content.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": file_data
+                            }
+                        })
+
+    # Add the text prompt
+    content.append({
+        "type": "text",
+        "text": f"""You are a UK customs clearance expert for DSETA Consulting Ltd.
+Extract ALL available information from this email and any attached documents.
+
+EMAIL FROM: {from_email}
+SUBJECT: {subject}
+EMAIL BODY:
+{body}
+
+Extract every piece of information you can find and return ONLY a valid JSON object:
+{{
+  "services_requested": "List all services customer requested e.g. CDS, ENS, ELO, T1. If not stated write To be confirmed",
+  "exporter_name": "Full exporter company name",
+  "exporter_address": "Full exporter address including country",
+  "exporter_eori": "Exporter EORI number if found",
+  "importer_name": "Full importer company name",
+  "importer_address": "Full importer address",
+  "importer_eori": "Importer EORI number if found",
+  "goods_description": "Full description of goods",
+  "commodity_code": "HS/commodity code",
+  "country_of_origin": "Country of origin",
+  "preferential_origin": "Preferential origin / REX number if found",
+  "number_of_packages": "Number and type of packages e.g. 20 pallets",
+  "gross_weight": "Gross weight in kg",
+  "net_weight": "Net weight in kg",
+  "invoice_number": "Invoice reference number",
+  "invoice_value": "Invoice value with currency",
+  "incoterms": "Incoterms e.g. DAP, FOB, CIF",
+  "freight_cost": "Freight cost if mentioned",
+  "route": "Route e.g. Calais to Dover",
+  "transport_mode": "Transport mode e.g. RoRo, Accompanied, Unaccompanied",
+  "vehicle_reg": "Vehicle or trailer registration if found",
+  "carrier": "Carrier or haulier name if found",
+  "health_cert": "Health certificate number if found",
+  "additional_notes": "Any other relevant information"
+}}
+For any field not found write: To be confirmed"""
+    })
+
     payload = {
         "model": "claude-opus-4-5",
-        "max_tokens": 1000,
-        "messages": [{
-            "role": "user",
-            "content": f"""You are a customs clearance assistant for DSETA Consulting Ltd.
-A new clearance request email has arrived. Extract all available information.
-
-From: {from_email}
-Subject: {subject}
-Email Body: {body}
-
-Return ONLY a valid JSON object, no markdown, no explanation, no code blocks:
-{{
-  "services": "list all services mentioned such as CDS, ENS, ELO. If not stated write To be confirmed",
-  "exporter": "exporter company name and country if mentioned, else To be confirmed",
-  "importer": "importer company name if mentioned, else To be confirmed",
-  "goods": "description of goods if mentioned, else To be confirmed",
-  "route": "shipping route if mentioned e.g. Calais to Dover, else To be confirmed",
-  "commodity_code": "commodity code if mentioned, else To be confirmed",
-  "invoice_value": "invoice value and currency if mentioned, else To be confirmed",
-  "incoterms": "incoterms if mentioned e.g. DAP, FOB, else To be confirmed",
-  "transport": "vehicle reg or trailer number if mentioned, else To be confirmed"
-}}"""
-        }]
+        "max_tokens": 2000,
+        "messages": [{"role": "user", "content": content}]
     }
 
     try:
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=60.0) as client:
             response = client.post(
                 "https://api.anthropic.com/v1/messages",
                 headers=headers,
@@ -92,90 +149,117 @@ Return ONLY a valid JSON object, no markdown, no explanation, no code blocks:
         if "content" in result and len(result["content"]) > 0:
             text = result["content"][0].get("text", "{}")
             text = text.strip()
-            # Remove markdown if present
             if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            text = text.strip()
+                lines = text.split("\n")
+                text = "\n".join(lines[1:-1])
             return json.loads(text)
         else:
             raise Exception(f"API error: {result}")
     except Exception as e:
-        return {
-            "services": "To be confirmed",
-            "exporter": "To be confirmed",
-            "importer": "To be confirmed",
-            "goods": "To be confirmed",
-            "route": "To be confirmed",
-            "commodity_code": "To be confirmed",
-            "invoice_value": "To be confirmed",
-            "incoterms": "To be confirmed",
-            "transport": "To be confirmed"
-        }
+        return {field: "To be confirmed" for field in [
+            "services_requested","exporter_name","exporter_address",
+            "exporter_eori","importer_name","importer_address","importer_eori",
+            "goods_description","commodity_code","country_of_origin",
+            "preferential_origin","number_of_packages","gross_weight",
+            "net_weight","invoice_number","invoice_value","incoterms",
+            "freight_cost","route","transport_mode","vehicle_reg",
+            "carrier","health_cert","additional_notes"
+        ]}
+
+def build_input_sheet(ref, from_email, date, subject, d):
+    """Build the formatted Descartes input sheet"""
+    return f"""DSETA CONSULTING LTD — CUSTOMS CLEARANCE INPUT SHEET
+{'='*60}
+REFERENCE:        {ref}
+DATE RECEIVED:    {date}
+FROM:             {from_email}
+SUBJECT:          {subject}
+{'='*60}
+
+SERVICES REQUESTED
+{'─'*60}
+{d.get('services_requested', 'To be confirmed')}
+
+{'='*60}
+EXPORTER DETAILS
+{'─'*60}
+Name:             {d.get('exporter_name', 'To be confirmed')}
+Address:          {d.get('exporter_address', 'To be confirmed')}
+EORI:             {d.get('exporter_eori', 'To be confirmed')}
+
+IMPORTER DETAILS
+{'─'*60}
+Name:             {d.get('importer_name', 'To be confirmed')}
+Address:          {d.get('importer_address', 'To be confirmed')}
+EORI:             {d.get('importer_eori', 'To be confirmed')}
+
+{'='*60}
+GOODS DETAILS
+{'─'*60}
+Description:      {d.get('goods_description', 'To be confirmed')}
+Commodity Code:   {d.get('commodity_code', 'To be confirmed')}
+Country of Origin:{d.get('country_of_origin', 'To be confirmed')}
+Preferential/REX: {d.get('preferential_origin', 'To be confirmed')}
+Packages:         {d.get('number_of_packages', 'To be confirmed')}
+Gross Weight:     {d.get('gross_weight', 'To be confirmed')}
+Net Weight:       {d.get('net_weight', 'To be confirmed')}
+
+{'='*60}
+FINANCIAL DETAILS
+{'─'*60}
+Invoice Number:   {d.get('invoice_number', 'To be confirmed')}
+Invoice Value:    {d.get('invoice_value', 'To be confirmed')}
+Incoterms:        {d.get('incoterms', 'To be confirmed')}
+Freight Cost:     {d.get('freight_cost', 'To be confirmed')}
+
+{'='*60}
+TRANSPORT DETAILS
+{'─'*60}
+Route:            {d.get('route', 'To be confirmed')}
+Transport Mode:   {d.get('transport_mode', 'To be confirmed')}
+Vehicle/Trailer:  {d.get('vehicle_reg', 'To be confirmed')}
+Carrier:          {d.get('carrier', 'To be confirmed')}
+
+{'='*60}
+DOCUMENTS & CERTIFICATES
+{'─'*60}
+Health Cert:      {d.get('health_cert', 'To be confirmed')}
+
+{'='*60}
+ADDITIONAL NOTES
+{'─'*60}
+{d.get('additional_notes', 'None')}
+
+{'='*60}
+Generated: {datetime.datetime.now().strftime("%d/%m/%Y %H:%M")}
+⚠️  Verify all details before submitting to Descartes
+"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTE 1 — New email
-# POST /new-email
-# Zapier sends: from_email, subject, body, date, last_reference
 # ══════════════════════════════════════════════════════════════════════════════
 @app.route("/new-email", methods=["POST"])
 def new_email():
-    data       = request.json or {}
-    from_email = data.get("from_email", "").strip()
-    subject    = data.get("subject", "No subject").strip()
-    body       = data.get("body", "").strip()
-    date       = data.get("date", datetime.datetime.now().strftime("%d/%m/%Y"))
-    last_ref   = data.get("last_reference", "")
+    data             = request.json or {}
+    from_email       = data.get("from_email", "").strip()
+    subject          = data.get("subject", "No subject").strip()
+    body             = data.get("body", "").strip()
+    date             = data.get("date", datetime.datetime.now().strftime("%d/%m/%Y"))
+    last_ref         = data.get("last_reference", "")
+    attachment_urls  = data.get("attachments", [])
 
-    # ── Block loop emails ──────────────────────────────────────────────────────
-    if should_ignore_email(from_email):
-        return jsonify({
-            "status": "ignored",
-            "reason": f"Email from {from_email} ignored — internal or system sender"
-        }), 200
-
-    # ── Block if no body (empty trigger) ──────────────────────────────────────
-    if not from_email or from_email == "unknown@email.com":
-        return jsonify({
-            "status": "ignored",
-            "reason": "No valid sender email"
-        }), 200
+    # Block loop/system emails
+    if should_ignore_email(from_email) or not from_email:
+        return jsonify({"status": "ignored", "reason": f"Ignored: {from_email}"}), 200
 
     try:
         ref      = get_next_reference(last_ref)
-        job_data = extract_job_data(from_email, subject, body)
-        folder_name = f"{ref} — {from_email}"
+        job_data = extract_all_data(from_email, subject, body, attachment_urls)
+        folder_name  = f"{ref} — {from_email}"
+        input_sheet  = build_input_sheet(ref, from_email, date, subject, job_data)
 
-        input_sheet = f"""DSETA CONSULTING — DESCARTES INPUT SHEET
-{'='*55}
-Reference:       {ref}
-From:            {from_email}
-Date:            {date}
-Subject:         {subject}
-{'='*55}
-SERVICES:        {job_data.get('services', 'To be confirmed')}
-{'='*55}
-GOODS DETAILS
-Goods:           {job_data.get('goods', 'To be confirmed')}
-Commodity Code:  {job_data.get('commodity_code', 'To be confirmed')}
-Invoice Value:   {job_data.get('invoice_value', 'To be confirmed')}
-Incoterms:       {job_data.get('incoterms', 'To be confirmed')}
-{'='*55}
-PARTIES
-Exporter:        {job_data.get('exporter', 'To be confirmed')}
-Importer:        {job_data.get('importer', 'To be confirmed')}
-{'='*55}
-TRANSPORT
-Route:           {job_data.get('route', 'To be confirmed')}
-Transport:       {job_data.get('transport', 'To be confirmed')}
-{'='*55}
-Generated: {datetime.datetime.now().strftime("%d/%m/%Y %H:%M")}
-⚠️  Please verify all details before submitting to Descartes
-"""
-
-        # Auto reply — from name not raw email
+        auto_reply_subject = f"Clearance Request Received — Reference {ref}"
         auto_reply = f"""Dear Customer,
 
 Thank you for contacting DSETA Consulting Ltd.
@@ -184,7 +268,7 @@ We have received your documents and your clearance request has been logged under
 
 Please use this reference number in all future correspondence relating to this shipment.
 
-Services noted: {job_data.get('services', 'To be confirmed')}
+Services noted: {job_data.get('services_requested', 'To be confirmed')}
 
 We will begin processing your declaration and will be in touch shortly.
 
@@ -195,24 +279,22 @@ Tel: +44 XXXX XXXXXX
 Email: customs@dseta.co.uk
 www.dseta.co.uk"""
 
-        auto_reply_subject = f"Clearance Request Received — Reference {ref}"
-
         return jsonify({
-            "status":               "success",
-            "reference":            ref,
-            "folder_name":          folder_name,
-            "from_email":           from_email,
-            "services":             job_data.get("services", "To be confirmed"),
-            "exporter":             job_data.get("exporter", "To be confirmed"),
-            "importer":             job_data.get("importer", "To be confirmed"),
-            "goods":                job_data.get("goods", "To be confirmed"),
-            "route":                job_data.get("route", "To be confirmed"),
-            "commodity_code":       job_data.get("commodity_code", "To be confirmed"),
-            "invoice_value":        job_data.get("invoice_value", "To be confirmed"),
-            "input_sheet":          input_sheet,
-            "auto_reply":           auto_reply,
-            "auto_reply_subject":   auto_reply_subject,
-            "date":                 date
+            "status":             "success",
+            "reference":          ref,
+            "folder_name":        folder_name,
+            "from_email":         from_email,
+            "services":           job_data.get("services_requested", "To be confirmed"),
+            "exporter":           job_data.get("exporter_name", "To be confirmed"),
+            "importer":           job_data.get("importer_name", "To be confirmed"),
+            "goods":              job_data.get("goods_description", "To be confirmed"),
+            "commodity_code":     job_data.get("commodity_code", "To be confirmed"),
+            "invoice_value":      job_data.get("invoice_value", "To be confirmed"),
+            "route":              job_data.get("route", "To be confirmed"),
+            "input_sheet":        input_sheet,
+            "auto_reply":         auto_reply,
+            "auto_reply_subject": auto_reply_subject,
+            "date":               date
         }), 200
 
     except Exception as e:
@@ -221,14 +303,12 @@ www.dseta.co.uk"""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTE 2 — Job completed
-# POST /job-completed
 # ══════════════════════════════════════════════════════════════════════════════
 @app.route("/job-completed", methods=["POST"])
 def job_completed():
     data       = request.json or {}
     reference  = data.get("reference", "")
     from_email = data.get("from_email", "")
-    files      = data.get("files", "your clearance documents")
 
     completion_email = f"""Dear Customer,
 
@@ -247,25 +327,18 @@ Tel: +44 XXXX XXXXXX
 Email: customs@dseta.co.uk
 www.dseta.co.uk"""
 
-    completion_subject = f"Clearance Complete — Reference {reference}"
-
     return jsonify({
         "status":             "success",
         "reference":          reference,
         "from_email":         from_email,
         "completion_email":   completion_email,
-        "completion_subject": completion_subject
+        "completion_subject": f"Clearance Complete — Reference {reference}"
     }), 200
 
 
-# ── Health check ───────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "DSETA webhook running",
-        "version": "4.0",
-        "endpoints": ["/new-email", "/job-completed"]
-    }), 200
+    return jsonify({"status": "DSETA webhook running", "version": "5.0"}), 200
 
 
 if __name__ == "__main__":
